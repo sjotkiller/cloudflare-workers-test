@@ -1,7 +1,102 @@
 export default {
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const ip = request.headers.get('CF-Connecting-IP');
+    const country = request.cf?.country;
+    const userAgent = request.headers.get('User-Agent');
     
-    // Hent firewall regler
+    let blocked = false;
+    let blockReason = '';
+    
+    // ============================================
+    // REGEL 1: Geographic Blocking
+    // ============================================
+    const blockedCountries = ['CN', 'RU', 'KP', 'IR'];
+    if (blockedCountries.includes(country)) {
+      blocked = true;
+      blockReason = `Geographic restriction (${country})`;
+    }
+    
+    // ============================================
+    // REGEL 2: Block Bots on /api
+    // ============================================
+    const botPatterns = ['bot', 'crawler', 'spider', 'scraper', 'curl', 'wget', 'python-requests'];
+    const isBot = botPatterns.some(pattern => userAgent?.toLowerCase().includes(pattern));
+    
+    if (!blocked && isBot && url.pathname === '/api') {
+      blocked = true;
+      blockReason = 'Bot detected on /api';
+    }
+    
+    // ============================================
+    // REGEL 3: HTTP Method Filtering
+    // ============================================
+    const allowedMethods = ['GET', 'HEAD', 'OPTIONS'];
+    if (!blocked && !allowedMethods.includes(request.method)) {
+      blocked = true;
+      blockReason = `Method ${request.method} not allowed`;
+    }
+    
+    // ============================================
+    // REGEL 4: URL Path Blocking
+    // ============================================
+    const blockedPaths = ['/admin', '/.env', '/wp-admin'];
+    if (!blocked && blockedPaths.some(path => url.pathname.startsWith(path))) {
+      blocked = true;
+      blockReason = `Path ${url.pathname} blocked`;
+    }
+    
+    // ============================================
+    // REGEL 5: SQL Injection Detection
+    // ============================================
+    const sqlInjectionPatterns = ['SELECT', 'UNION', 'DROP', 'INSERT', '--', ';'];
+    const queryString = url.search.toUpperCase();
+    const hasSQLInjection = sqlInjectionPatterns.some(pattern => queryString.includes(pattern));
+    
+    if (!blocked && hasSQLInjection) {
+      blocked = true;
+      blockReason = 'SQL injection detected';
+    }
+    
+    // ============================================
+    // LOG HVIS BLOKERET
+    // ============================================
+    if (blocked) {
+      const logEntry = {
+        timestamp: new Date().toISOString(),
+        ip: ip,
+        country: country,
+        path: url.pathname,
+        query: url.search,
+        method: request.method,
+        userAgent: userAgent,
+        reason: blockReason,
+        action: 'BLOCKED'
+      };
+      
+      // Gem til KV storage
+      const logKey = `log:${Date.now()}:${Math.random().toString(36).substr(2, 9)}`;
+      await env.FIREWALL_LOGS.put(logKey, JSON.stringify(logEntry), {
+        expirationTtl: 86400 // Logs slettes efter 24 timer
+      });
+      
+      return new Response(
+        JSON.stringify({
+          error: 'Access Denied',
+          reason: blockReason
+        }), 
+        { 
+          status: 403,
+          headers: { 'Content-Type': 'application/json' }
+        }
+      );
+    }
+    
+    // ============================================
+    // HVIS IKKE BLOKERET - VIS DASHBOARD
+    // ============================================
+    
+    // Hent firewall regler fra Cloudflare API
     const rulesResponse = await fetch(
       `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/gateway/rules`,
       {
@@ -14,57 +109,19 @@ export default {
     const rulesData = await rulesResponse.json();
     const rules = rulesData.result || [];
 
-    // Hent Gateway logs via GraphQL
-    const now = new Date();
-    const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
+    // Hent logs fra KV
+    const logsList = await env.FIREWALL_LOGS.list({ limit: 100 });
+    const logs = [];
     
-    const graphqlQuery = {
-      query: `{
-        viewer {
-          accounts(filter: {accountTag: "${env.CLOUDFLARE_ACCOUNT_ID}"}) {
-            gatewayActivityLog(
-              filter: {
-                datetime_geq: "${oneHourAgo.toISOString()}"
-                datetime_leq: "${now.toISOString()}"
-              }
-              limit: 100
-              orderBy: [datetime_DESC]
-            ) {
-              datetime
-              sourceIP
-              destinationIP
-              destinationPort
-              action
-              ruleId
-              ruleName
-              sourceCountry
-            }
-          }
-        }
-      }`
-    };
-
-    let logs = [];
-    try {
-      const logsResponse = await fetch(
-        'https://api.cloudflare.com/client/v4/graphql',
-        {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${env.CLOUDFLARE_ANALYTICS_TOKEN}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(graphqlQuery)
-        }
-      );
-      
-      const logsData = await logsResponse.json();
-      if (logsData.data?.viewer?.accounts?.[0]?.gatewayActivityLog) {
-        logs = logsData.data.viewer.accounts[0].gatewayActivityLog;
+    for (const key of logsList.keys) {
+      const logData = await env.FIREWALL_LOGS.get(key.name);
+      if (logData) {
+        logs.push(JSON.parse(logData));
       }
-    } catch (error) {
-      console.error('Error fetching logs:', error);
     }
+    
+    // Sorter logs (nyeste først)
+    logs.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
 
     // HTML for regler
     const rulesHTML = rules.map(rule => `
@@ -81,25 +138,25 @@ export default {
         <div class="rule-details">
           <p><strong>ID:</strong> ${rule.id}</p>
           <p><strong>Oprettet:</strong> ${new Date(rule.created_at).toLocaleString('da-DK')}</p>
-          <p><strong>Expression:</strong> <code>${rule.traffic || 'Ingen'}</code></p>
         </div>
       </div>
     `).join('');
 
-    // HTML for logs
-    const logsHTML = logs.length > 0 ? logs.map(log => `
-      <div class="log-entry ${log.action === 'block' ? 'blocked' : ''}">
+    // HTML for Worker firewall logs
+    const workerLogsHTML = logs.length > 0 ? logs.slice(0, 50).map(log => `
+      <div class="log-entry blocked">
         <div class="log-header">
-          <span class="log-time">🕒 ${new Date(log.datetime).toLocaleString('da-DK')}</span>
-          <span class="badge action-${log.action}">${log.action?.toUpperCase() || 'UNKNOWN'}</span>
+          <span class="log-time">🕒 ${new Date(log.timestamp).toLocaleString('da-DK')}</span>
+          <span class="badge action-block">${log.action}</span>
         </div>
         <div class="log-details">
-          <p><strong>🌍 Source:</strong> ${log.sourceIP} ${log.sourceCountry ? `(${log.sourceCountry})` : ''}</p>
-          <p><strong>📍 Destination:</strong> ${log.destinationIP}${log.destinationPort ? `:${log.destinationPort}` : ''}</p>
-          ${log.ruleName ? `<p><strong>🚫 Regel:</strong> ${log.ruleName}</p>` : ''}
+          <p><strong>🌍 Source:</strong> ${log.ip} ${log.country ? `(${log.country})` : ''}</p>
+          <p><strong>📍 Path:</strong> ${log.path}${log.query || ''}</p>
+          <p><strong>🚫 Reason:</strong> ${log.reason}</p>
+          <p><strong>🔧 Method:</strong> ${log.method}</p>
         </div>
       </div>
-    `).join('') : '<div class="no-data">Ingen logs fundet i den seneste time. Prøv at besøge din tunnel fra en blokeret IP eller port.</div>';
+    `).join('') : '<div class="no-data">Ingen blokeret trafik endnu. Worker firewall logger kun blokeret trafik.</div>';
 
     const html = `
       <!DOCTYPE html>
@@ -249,7 +306,6 @@ export default {
           .inactive { background: #3a1a1a; color: #ff4444; }
           .action-block { background: #3a1a1a; color: #ff4444; }
           .action-allow { background: #1a3a1a; color: #00ff00; }
-          .action-unknown { background: #3a3a1a; color: #ffaa00; }
 
           .rule-details, .log-details {
             color: #aaa;
@@ -258,14 +314,6 @@ export default {
 
           .rule-details p, .log-details p {
             margin: 5px 0;
-          }
-
-          .rule-details code {
-            background: #2a2a2a;
-            padding: 2px 6px;
-            border-radius: 4px;
-            color: #f6821f;
-            font-size: 0.85em;
           }
 
           .no-data {
@@ -294,22 +342,22 @@ export default {
       <body>
         <div class="container">
           <h1>🔥 Cloudflare Firewall Dashboard</h1>
-          <p class="subtitle">Live oversigt over Zero Trust Gateway regler & aktivitet</p>
+          <p class="subtitle">Live oversigt over Zero Trust Gateway regler & Worker firewall logs</p>
 
           <div class="tabs">
-            <button class="tab active" onclick="switchTab('rules')">📊 Firewall Regler</button>
-            <button class="tab" onclick="switchTab('logs')">📋 Aktivitets Logs (seneste time)</button>
+            <button class="tab active" onclick="switchTab('rules')">📊 Gateway Regler</button>
+            <button class="tab" onclick="switchTab('logs')">📋 Worker Firewall Logs</button>
           </div>
 
           <div id="rules-tab" class="tab-content active">
             <div class="stats">
               <div class="stat-box">
                 <div class="number">${rules.length}</div>
-                <div class="label">Totale regler</div>
+                <div class="label">Gateway regler</div>
               </div>
               <div class="stat-box">
                 <div class="number">${rules.filter(r => r.enabled).length}</div>
-                <div class="label">Aktive regler</div>
+                <div class="label">Aktive</div>
               </div>
               <div class="stat-box">
                 <div class="number">${rules.filter(r => r.action === 'block').length}</div>
@@ -317,25 +365,29 @@ export default {
               </div>
             </div>
 
-            ${rulesHTML || '<p class="no-data">Ingen regler fundet</p>'}
+            ${rulesHTML || '<p class="no-data">Ingen Gateway regler fundet</p>'}
           </div>
 
           <div id="logs-tab" class="tab-content">
             <div class="stats">
               <div class="stat-box">
                 <div class="number">${logs.length}</div>
-                <div class="label">Log entries (seneste time)</div>
+                <div class="label">Blokeret (24t)</div>
               </div>
               <div class="stat-box">
-                <div class="number">${logs.filter(l => l.action === 'block').length}</div>
-                <div class="label">Blokeret</div>
+                <div class="number">${logs.filter(l => l.reason.includes('Geographic')).length}</div>
+                <div class="label">Geographic blocks</div>
+              </div>
+              <div class="stat-box">
+                <div class="number">${logs.filter(l => l.reason.includes('Path')).length}</div>
+                <div class="label">Path blocks</div>
               </div>
             </div>
 
-            ${logsHTML}
+            ${workerLogsHTML}
           </div>
 
-          <p class="updated">Sidst opdateret: ${new Date().toLocaleString('da-DK')}</p>
+          <p class="updated">Sidst opdateret: ${new Date().toLocaleString('da-DK')} | Logs gemmes i 24 timer</p>
         </div>
 
         <script>
@@ -355,6 +407,9 @@ export default {
               document.querySelectorAll('.tab')[1].classList.add('active');
             }
           }
+          
+          // Auto-refresh hver 30 sekunder
+          setTimeout(() => location.reload(), 30000);
         </script>
       </body>
       </html>
