@@ -1,6 +1,5 @@
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
     
     // Hent firewall regler
     const rulesResponse = await fetch(
@@ -15,18 +14,57 @@ export default {
     const rulesData = await rulesResponse.json();
     const rules = rulesData.result || [];
 
-    // Hent Gateway logs (aktivitet)
-    const logsResponse = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/gateway/logs`,
-      {
-        headers: {
-          'Authorization': `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
-          'Content-Type': 'application/json'
+    // Hent Gateway logs via GraphQL
+    const now = new Date();
+    const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
+    
+    const graphqlQuery = {
+      query: `{
+        viewer {
+          accounts(filter: {accountTag: "${env.CLOUDFLARE_ACCOUNT_ID}"}) {
+            gatewayActivityLog(
+              filter: {
+                datetime_geq: "${oneHourAgo.toISOString()}"
+                datetime_leq: "${now.toISOString()}"
+              }
+              limit: 100
+              orderBy: [datetime_DESC]
+            ) {
+              datetime
+              sourceIP
+              destinationIP
+              destinationPort
+              action
+              ruleId
+              ruleName
+              sourceCountry
+            }
+          }
         }
+      }`
+    };
+
+    let logs = [];
+    try {
+      const logsResponse = await fetch(
+        'https://api.cloudflare.com/client/v4/graphql',
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${env.CLOUDFLARE_ANALYTICS_TOKEN}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(graphqlQuery)
+        }
+      );
+      
+      const logsData = await logsResponse.json();
+      if (logsData.data?.viewer?.accounts?.[0]?.gatewayActivityLog) {
+        logs = logsData.data.viewer.accounts[0].gatewayActivityLog;
       }
-    );
-    const logsData = await logsResponse.json();
-    const logs = logsData.result || [];
+    } catch (error) {
+      console.error('Error fetching logs:', error);
+    }
 
     // HTML for regler
     const rulesHTML = rules.map(rule => `
@@ -49,18 +87,19 @@ export default {
     `).join('');
 
     // HTML for logs
-    const logsHTML = logs.length > 0 ? logs.slice(0, 50).map(log => `
-      <div class="log-entry">
+    const logsHTML = logs.length > 0 ? logs.map(log => `
+      <div class="log-entry ${log.action === 'block' ? 'blocked' : ''}">
         <div class="log-header">
-          <span class="log-time">${new Date(log.timestamp).toLocaleString('da-DK')}</span>
-          <span class="badge action-${log.action || 'unknown'}">${log.action || 'UNKNOWN'}</span>
+          <span class="log-time">🕒 ${new Date(log.datetime).toLocaleString('da-DK')}</span>
+          <span class="badge action-${log.action}">${log.action?.toUpperCase() || 'UNKNOWN'}</span>
         </div>
         <div class="log-details">
-          <p><strong>Type:</strong> ${log.type || 'N/A'}</p>
-          <p><strong>Besked:</strong> ${log.message || 'Ingen detaljer'}</p>
+          <p><strong>🌍 Source:</strong> ${log.sourceIP} ${log.sourceCountry ? `(${log.sourceCountry})` : ''}</p>
+          <p><strong>📍 Destination:</strong> ${log.destinationIP}${log.destinationPort ? `:${log.destinationPort}` : ''}</p>
+          ${log.ruleName ? `<p><strong>🚫 Regel:</strong> ${log.ruleName}</p>` : ''}
         </div>
       </div>
-    `).join('') : '<p class="no-data">Ingen logs tilgængelige endnu</p>';
+    `).join('') : '<div class="no-data">Ingen logs fundet i den seneste time. Prøv at besøge din tunnel fra en blokeret IP eller port.</div>';
 
     const html = `
       <!DOCTYPE html>
@@ -171,6 +210,10 @@ export default {
             border-color: #f6821f;
           }
 
+          .log-entry.blocked {
+            border-left: 4px solid #ff4444;
+          }
+
           .rule-header, .log-header {
             display: flex;
             align-items: center;
@@ -191,7 +234,7 @@ export default {
             font-size: 1em;
             color: #aaa;
             flex: 1;
-            min-width: 150px;
+            min-width: 200px;
           }
 
           .badge {
@@ -229,7 +272,9 @@ export default {
             text-align: center;
             color: #666;
             padding: 40px;
-            font-size: 1.1em;
+            font-size: 1em;
+            background: #1a1a1a;
+            border-radius: 8px;
           }
 
           .updated {
@@ -253,7 +298,7 @@ export default {
 
           <div class="tabs">
             <button class="tab active" onclick="switchTab('rules')">📊 Firewall Regler</button>
-            <button class="tab" onclick="switchTab('logs')">📋 Aktivitets Logs</button>
+            <button class="tab" onclick="switchTab('logs')">📋 Aktivitets Logs (seneste time)</button>
           </div>
 
           <div id="rules-tab" class="tab-content active">
@@ -279,7 +324,11 @@ export default {
             <div class="stats">
               <div class="stat-box">
                 <div class="number">${logs.length}</div>
-                <div class="label">Log entries</div>
+                <div class="label">Log entries (seneste time)</div>
+              </div>
+              <div class="stat-box">
+                <div class="number">${logs.filter(l => l.action === 'block').length}</div>
+                <div class="label">Blokeret</div>
               </div>
             </div>
 
@@ -291,7 +340,6 @@ export default {
 
         <script>
           function switchTab(tab) {
-            // Skjul alle tabs
             document.querySelectorAll('.tab-content').forEach(el => {
               el.classList.remove('active');
             });
@@ -299,7 +347,6 @@ export default {
               el.classList.remove('active');
             });
 
-            // Vis valgt tab
             if (tab === 'rules') {
               document.getElementById('rules-tab').classList.add('active');
               document.querySelectorAll('.tab')[0].classList.add('active');
