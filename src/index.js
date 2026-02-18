@@ -17,7 +17,7 @@ export default {
 
     // Hent Gateway logs (aktivitet)
     const logsResponse = await fetch(
-      `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/gateway/audit_logs`,
+      `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/gateway/logs`,
       {
         headers: {
           'Authorization': `Bearer ${env.CLOUDFLARE_API_TOKEN}`,
