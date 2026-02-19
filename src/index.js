@@ -390,7 +390,7 @@ export default {
           <p class="updated">Sidst opdateret: ${new Date().toLocaleString('da-DK')} | Logs gemmes i 24 timer</p>
         </div>
 
-        <script>
+       <script>
           function switchTab(tab) {
             document.querySelectorAll('.tab-content').forEach(el => {
               el.classList.remove('active');
@@ -398,7 +398,6 @@ export default {
             document.querySelectorAll('.tab').forEach(el => {
               el.classList.remove('active');
             });
-
             if (tab === 'rules') {
               document.getElementById('rules-tab').classList.add('active');
               document.querySelectorAll('.tab')[0].classList.add('active');
@@ -406,8 +405,14 @@ export default {
               document.getElementById('logs-tab').classList.add('active');
               document.querySelectorAll('.tab')[1].classList.add('active');
             }
+
+            localStorage.setItem('activeTab', tab);
           }
-          
+
+          // Gendan aktiv fane efter reload
+          const savedTab = localStorage.getItem('activeTab');
+          if (savedTab) switchTab(savedTab);
+
           // Auto-refresh hver 30 sekunder
           setTimeout(() => location.reload(), 30000);
         </script>
